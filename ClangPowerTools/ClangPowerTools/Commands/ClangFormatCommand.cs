@@ -1,15 +1,15 @@
-﻿using System;
-using System.ComponentModel.Design;
-using System.IO;
-using System.Linq;
-using System.Xml.Linq;
-using ClangPowerTools.DialogPages;
+﻿using ClangPowerTools.DialogPages;
 using ClangPowerTools.Output;
 using EnvDTE;
 using Microsoft.VisualStudio.Shell;
 using Microsoft.VisualStudio.Shell.Interop;
 using Microsoft.VisualStudio.Text;
 using Microsoft.VisualStudio.Text.Editor;
+using System;
+using System.ComponentModel.Design;
+using System.IO;
+using System.Linq;
+using System.Xml.Linq;
 
 namespace ClangPowerTools.Commands
 {
@@ -22,6 +22,10 @@ namespace ClangPowerTools.Commands
 
     private ClangFormatOptionsView mClangFormatView = null;
     private Document mDocument = null;
+
+    private object Mutex1 = new object();
+    private object Mutex2 = new object();
+
 
     #endregion
 
@@ -49,7 +53,7 @@ namespace ClangPowerTools.Commands
     /// Adds our command handlers for menu (commands must exist in the command table file)
     /// </summary>
     /// <param name="package">Owner package, not null.</param>
-    private ClangFormatCommand(OleMenuCommandService aCommandService, CommandsController aCommandsController, ErrorWindowController aErrorWindow, 
+    private ClangFormatCommand(OleMenuCommandService aCommandService, CommandsController aCommandsController, ErrorWindowController aErrorWindow,
       OutputWindowController aOutputWindow, AsyncPackage aPackage, Guid aGuid, int aId)
         : base(aCommandsController, aErrorWindow, aOutputWindow, aPackage, aGuid, aId)
     {
@@ -73,7 +77,7 @@ namespace ClangPowerTools.Commands
     /// Initializes the singleton instance of the command.
     /// </summary>
     /// <param name="package">Owner package, not null.</param>
-    public static async System.Threading.Tasks.Task InitializeAsync(CommandsController aCommandsController, 
+    public static async System.Threading.Tasks.Task InitializeAsync(CommandsController aCommandsController,
       ErrorWindowController aErrorWindow, OutputWindowController aOutputWindow, AsyncPackage aPackage, Guid aGuid, int aId)
     {
       // Switch to the main thread - the call to AddCommand in ClangFormatCommand's constructor requires
@@ -131,72 +135,78 @@ namespace ClangPowerTools.Commands
     /// <param name="e">Event args.</param>
     private void RunClangFormat(object sender, EventArgs e)
     {
-      try
+      System.Threading.Tasks.Task.Run(() =>
       {
-        if (null == mClangFormatView)
-        {
-          FormatAllSelectedDocuments();
-          return;
-        }
-
-        var view = Vsix.GetDocumentView(mDocument);
-        if (view == null)
-          return;
-
-        System.Diagnostics.Process process;
-        var dirPath = string.Empty;
-        var filePath = Vsix.GetDocumentPath(view);
-        var text = view.TextBuffer.CurrentSnapshot.GetText();
-
-        var startPosition = 0;
-        var length = text.Length;
-
-        if (false == view.Selection.StreamSelectionSpan.IsEmpty)
-        {
-          // get the necessary elements for format selection
-          FindStartPositionAndLengthOfSelectedText(view, text, out startPosition, out length);
-          dirPath = Vsix.GetDocumentParent(view);
-          mClangFormatView = GetUserOptions();
-        }
-        else
-        {
-          // format the end of the file for format document
-          text = FormatEndOfFile(view, filePath, out dirPath);
-        }
-
-        process = CreateProcess(text, startPosition, length, dirPath, filePath, mClangFormatView);
-
         try
         {
-          process.Start();
+          if (null == mClangFormatView)
+          {
+            FormatAllSelectedDocuments();
+            return;
+          }
+
+          var view = Vsix.GetDocumentView(mDocument);
+          if (view == null)
+            return;
+
+          System.Diagnostics.Process process;
+          var dirPath = string.Empty;
+          var filePath = Vsix.GetDocumentPath(view);
+          var text = view.TextBuffer.CurrentSnapshot.GetText();
+
+          var startPosition = 0;
+          var length = text.Length;
+
+          if (false == view.Selection.StreamSelectionSpan.IsEmpty)
+          {
+            // get the necessary elements for format selection
+            FindStartPositionAndLengthOfSelectedText(view, text, out startPosition, out length);
+            dirPath = Vsix.GetDocumentParent(view);
+            mClangFormatView = GetUserOptions();
+          }
+          else
+          {
+            lock(Mutex1)
+            {
+              // format the end of the file for format document
+              text = FormatEndOfFile(view, filePath, out dirPath);
+            }
+          }
+
+          process = CreateProcess(text, startPosition, length, dirPath, filePath, mClangFormatView);
+
+          try
+          {
+            process.Start();
+          }
+          catch (Exception exception)
+          {
+            throw new Exception(
+                $"Cannot execute {process.StartInfo.FileName}.\n{exception.Message}.");
+          }
+
+          process.StandardInput.Write(text);
+          process.StandardInput.Close();
+
+          var output = process.StandardOutput.ReadToEnd();
+          process.WaitForExit();
+
+          if (0 != process.ExitCode)
+            throw new Exception(process.StandardError.ReadToEnd());
+
+          ApplyClangFormat(output, view);
         }
         catch (Exception exception)
         {
-          throw new Exception(
-              $"Cannot execute {process.StartInfo.FileName}.\n{exception.Message}.");
+          VsShellUtilities.ShowMessageBox(AsyncPackage, exception.Message, "Error while running clang-format",
+            OLEMSGICON.OLEMSGICON_INFO, OLEMSGBUTTON.OLEMSGBUTTON_OK, OLEMSGDEFBUTTON.OLEMSGDEFBUTTON_FIRST);
         }
-
-        process.StandardInput.Write(text);
-        process.StandardInput.Close();
-
-        var output = process.StandardOutput.ReadToEnd();
-        process.WaitForExit();
-
-        if (0 != process.ExitCode)
-          throw new Exception(process.StandardError.ReadToEnd());
-
-        ApplyClangFormat(output, view);
-      }
-      catch (Exception exception)
-      {
-        VsShellUtilities.ShowMessageBox(AsyncPackage, exception.Message, "Error while running clang-format",
-          OLEMSGICON.OLEMSGICON_INFO, OLEMSGBUTTON.OLEMSGBUTTON_OK, OLEMSGDEFBUTTON.OLEMSGDEFBUTTON_FIRST);
-      }
-      finally
-      {
-        mDocument = null;
-        mClangFormatView = null;
-      }
+        finally
+        {
+          mDocument = null;
+          mClangFormatView = null;
+        }
+      });
     }
 
 
@@ -296,21 +306,28 @@ namespace ClangPowerTools.Commands
       return process;
     }
 
+
     private void ApplyClangFormat(string replacements, IWpfTextView view)
     {
       if (string.IsNullOrWhiteSpace(replacements))
         return;
 
       var root = XElement.Parse(replacements);
-      var edit = view.TextBuffer.CreateEdit();
-      foreach (XElement replacement in root.Descendants("replacement"))
+
+
+      lock (Mutex2)
       {
-        var span = new Span(
-            int.Parse(replacement.Attribute("offset").Value),
-            int.Parse(replacement.Attribute("length").Value));
-        edit.Replace(span, replacement.Value);
+        var edit = view.TextBuffer.CreateEdit();
+        foreach (XElement replacement in root.Descendants("replacement"))
+        {
+          var span = new Span(
+              int.Parse(replacement.Attribute("offset").Value),
+              int.Parse(replacement.Attribute("length").Value));
+          edit.Replace(span, replacement.Value);
+        }
+        edit.Apply();
       }
-      edit.Apply();
+
     }
 
     #endregion
